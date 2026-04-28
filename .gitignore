@@ -1,0 +1,12 @@
+build/
+build-*/
+*.db
+*.db-shm
+*.db-wal
+*.exe
+*.obj
+*.lib
+*.pdb
+*.ilk
+.vs/
+out/
