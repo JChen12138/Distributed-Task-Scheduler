@@ -1,16 +1,20 @@
 #include "task_store.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <stdexcept>
 
 namespace {
+std::atomic<std::uint64_t> next_task_sequence{0};
+
 std::int64_t now_ms() {
     const auto now = std::chrono::system_clock::now().time_since_epoch();
     return std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
 }
 
 std::string generate_task_id() {
-    return "task-" + std::to_string(now_ms());
+    const auto sequence = next_task_sequence.fetch_add(1, std::memory_order_relaxed);
+    return "task-" + std::to_string(now_ms()) + "-" + std::to_string(sequence);
 }
 
 void bind_text(sqlite3_stmt* stmt, int index, const std::string& value) {
@@ -60,6 +64,8 @@ TaskStore::~TaskStore() {
 }
 
 void TaskStore::initialize() {
+    std::lock_guard<std::mutex> lock(mutex_);
+
     exec(R"SQL(
         PRAGMA journal_mode = WAL;
     )SQL");
@@ -81,6 +87,8 @@ void TaskStore::initialize() {
 }
 
 Task TaskStore::create_task(const std::string& payload, int max_attempts) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
     const auto timestamp = now_ms();
     Task task;
     task.id = generate_task_id();
@@ -121,6 +129,8 @@ Task TaskStore::create_task(const std::string& payload, int max_attempts) {
 }
 
 std::vector<Task> TaskStore::list_tasks() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+
     sqlite3_stmt* stmt = nullptr;
     const char* sql = R"SQL(
         SELECT id, payload, status, attempt_count, max_attempts,
@@ -143,6 +153,8 @@ std::vector<Task> TaskStore::list_tasks() const {
 }
 
 std::optional<Task> TaskStore::get_task(const std::string& task_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+
     sqlite3_stmt* stmt = nullptr;
     const char* sql = R"SQL(
         SELECT id, payload, status, attempt_count, max_attempts,

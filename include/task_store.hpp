@@ -1,5 +1,6 @@
 #pragma once
 
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -13,7 +14,7 @@ public:
     explicit TaskStore(std::string db_path);
     ~TaskStore();
 
-    TaskStore(const TaskStore&) = delete;//a TaskStore object is not allowed to be copied.
+    TaskStore(const TaskStore&) = delete;
     TaskStore& operator=(const TaskStore&) = delete;
 
     void initialize();
@@ -24,6 +25,7 @@ public:
 private:
     sqlite3* db_ = nullptr;
     std::string db_path_;
+    mutable std::mutex mutex_;
 
     void exec(const char* sql) const;
 };

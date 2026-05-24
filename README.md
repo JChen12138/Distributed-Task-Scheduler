@@ -28,8 +28,40 @@ Workers should treat task execution as idempotent when external side effects mat
 - Shared `scheduler_core` library
 - SQLite-backed `TaskStore`
 - Durable `tasks` table
-- Initial task creation, listing, and lookup APIs at the storage layer
-- Placeholder scheduler and worker entry points
+- Scheduler HTTP API for task creation, listing, and lookup
+- Placeholder worker entry point
+
+## Scheduler API
+
+Create a task:
+
+```text
+POST /tasks
+Content-Type: application/json
+
+{
+  "payload": "demo task",
+  "max_attempts": 3
+}
+```
+
+List tasks:
+
+```text
+GET /tasks
+```
+
+Get one task:
+
+```text
+GET /tasks/{task_id}
+```
+
+Health check:
+
+```text
+GET /healthcheck
+```
 
 ## Task State Model
 
@@ -70,8 +102,26 @@ cmake -S . -B build-msvc-vcpkg -DCMAKE_TOOLCHAIN_FILE=C:/Users/16210/vcpkg/scrip
 cmake --build build-msvc-vcpkg --config Debug
 ```
 
-Run the initial scheduler storage smoke test:
+Run the scheduler API:
 
 ```powershell
-.\build-msvc-vcpkg\Debug\scheduler.exe .\scheduler.db
+.\build-msvc-vcpkg\Debug\scheduler.exe .\scheduler.db 8080
+```
+
+Create a task:
+
+```powershell
+curl.exe -X POST http://127.0.0.1:8080/tasks -H "Content-Type: application/json" -d "{\"payload\":\"demo task\",\"max_attempts\":3}"
+```
+
+List tasks:
+
+```powershell
+curl.exe http://127.0.0.1:8080/tasks
+```
+
+Get one task:
+
+```powershell
+curl.exe http://127.0.0.1:8080/tasks/<task-id>
 ```
