@@ -8,6 +8,7 @@
 #include <sqlite3.h>
 
 #include "task.hpp"
+#include "worker.hpp"
 
 class TaskStore {
 public:
@@ -21,6 +22,9 @@ public:
     Task create_task(const std::string& payload, int max_attempts);
     std::vector<Task> list_tasks() const;
     std::optional<Task> get_task(const std::string& task_id) const;
+    Worker register_worker(const std::string& worker_id);
+    std::optional<Worker> record_worker_heartbeat(const std::string& worker_id);
+    std::vector<Worker> list_workers() const;
 
 private:
     sqlite3* db_ = nullptr;

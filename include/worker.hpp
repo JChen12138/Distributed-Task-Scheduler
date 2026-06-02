@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 
 enum class WorkerStatus {
@@ -14,6 +15,12 @@ inline std::string to_string(WorkerStatus status) {
         case WorkerStatus::Offline: return "OFFLINE";
     }
     return "UNKNOWN";
+}
+
+inline std::optional<WorkerStatus> worker_status_from_string(const std::string& value) {
+    if (value == "ONLINE") return WorkerStatus::Online;
+    if (value == "OFFLINE") return WorkerStatus::Offline;
+    return std::nullopt;
 }
 
 struct Worker {

@@ -39,6 +39,15 @@ crow::json::wvalue task_to_json(const Task& task) {
     return body;
 }
 
+crow::json::wvalue worker_to_json(const Worker& worker) {
+    crow::json::wvalue body;
+    body["id"] = worker.id;
+    body["status"] = to_string(worker.status);
+    body["registered_at_ms"] = worker.registered_at_ms;
+    body["last_heartbeat_at_ms"] = worker.last_heartbeat_at_ms;
+    return body;
+}
+
 int parse_port(int argc, char** argv) {
     if (argc > 2) {
         return std::stoi(argv[2]);
@@ -122,6 +131,64 @@ int main(int argc, char** argv) {
                     return json_error(404, "Task not found");
                 }
                 return json_response(200, task_to_json(*task));
+            } catch (const std::exception& ex) {
+                return json_error(500, ex.what());
+            }
+        });
+
+        CROW_ROUTE(app, "/workers/register").methods("POST"_method)([&store](const crow::request& req) {
+            const auto request_body = crow::json::load(req.body);
+            if (!request_body) {
+                return json_error(400, "Request body must be valid JSON");
+            }
+            if (!request_body.has("worker_id") ||
+                request_body["worker_id"].t() != crow::json::type::String) {
+                return json_error(400, "Field 'worker_id' is required and must be a string");
+            }
+
+            const std::string worker_id = std::string(request_body["worker_id"].s());
+            if (worker_id.empty()) {
+                return json_error(400, "Field 'worker_id' must not be empty");
+            }
+
+            try {
+                const Worker worker = store.register_worker(worker_id);
+                return json_response(201, worker_to_json(worker));
+            } catch (const std::exception& ex) {
+                return json_error(500, ex.what());
+            }
+        });
+
+        CROW_ROUTE(app, "/workers/<string>/heartbeat").methods("POST"_method)(
+            [&store](const std::string& worker_id) {
+                if (worker_id.empty()) {
+                    return json_error(400, "Worker id must not be empty");
+                }
+
+                try {
+                    const auto worker = store.record_worker_heartbeat(worker_id);
+                    if (!worker.has_value()) {
+                        return json_error(404, "Worker not registered");
+                    }
+                    return json_response(200, worker_to_json(*worker));
+                } catch (const std::exception& ex) {
+                    return json_error(500, ex.what());
+                }
+            });
+
+        CROW_ROUTE(app, "/workers").methods("GET"_method)([&store] {
+            try {
+                const auto workers = store.list_workers();
+                crow::json::wvalue::list worker_list;
+                worker_list.reserve(workers.size());
+                for (const auto& worker : workers) {
+                    worker_list.push_back(worker_to_json(worker));
+                }
+
+                crow::json::wvalue body;
+                body["count"] = static_cast<int>(workers.size());
+                body["workers"] = std::move(worker_list);
+                return json_response(200, std::move(body));
             } catch (const std::exception& ex) {
                 return json_error(500, ex.what());
             }

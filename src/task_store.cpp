@@ -49,6 +49,20 @@ Task read_task(sqlite3_stmt* stmt) {
     }
     return task;
 }
+
+Worker read_worker(sqlite3_stmt* stmt) {
+    Worker worker;
+    worker.id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+    const auto status = worker_status_from_string(
+        reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1)));
+    if (!status.has_value()) {
+        throw std::runtime_error("invalid worker status stored in database");
+    }
+    worker.status = *status;
+    worker.registered_at_ms = sqlite3_column_int64(stmt, 2);
+    worker.last_heartbeat_at_ms = sqlite3_column_int64(stmt, 3);
+    return worker;
+}
 }
 
 TaskStore::TaskStore(std::string db_path): db_path_(std::move(db_path)) {
@@ -82,6 +96,15 @@ void TaskStore::initialize() {
             created_at_ms INTEGER NOT NULL,
             updated_at_ms INTEGER NOT NULL,
             completed_at_ms INTEGER
+        );
+    )SQL");
+
+    exec(R"SQL(
+        CREATE TABLE IF NOT EXISTS workers(
+            id TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            registered_at_ms INTEGER NOT NULL,
+            last_heartbeat_at_ms INTEGER NOT NULL
         );
     )SQL");
 }
@@ -175,6 +198,132 @@ std::optional<Task> TaskStore::get_task(const std::string& task_id) const {
     }
     sqlite3_finalize(stmt);
     return task;
+}
+
+Worker TaskStore::register_worker(const std::string& worker_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    const auto timestamp = now_ms();
+    sqlite3_stmt* stmt = nullptr;
+    const char* sql = R"SQL(
+        INSERT INTO workers(id, status, registered_at_ms, last_heartbeat_at_ms)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            status = excluded.status,
+            last_heartbeat_at_ms = excluded.last_heartbeat_at_ms;
+    )SQL";
+
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        throw std::runtime_error("failed to prepare worker registration");
+    }
+
+    bind_text(stmt, 1, worker_id);
+    bind_text(stmt, 2, to_string(WorkerStatus::Online));
+    sqlite3_bind_int64(stmt, 3, timestamp);
+    sqlite3_bind_int64(stmt, 4, timestamp);
+
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        sqlite3_finalize(stmt);
+        throw std::runtime_error("failed to register worker");
+    }
+    sqlite3_finalize(stmt);
+
+    Worker worker;
+    worker.id = worker_id;
+    worker.status = WorkerStatus::Online;
+    worker.last_heartbeat_at_ms = timestamp;
+
+    sqlite3_stmt* lookup_stmt = nullptr;
+    const char* lookup_sql = R"SQL(
+        SELECT registered_at_ms
+        FROM workers
+        WHERE id = ?;
+    )SQL";
+
+    if (sqlite3_prepare_v2(db_, lookup_sql, -1, &lookup_stmt, nullptr) != SQLITE_OK) {
+        throw std::runtime_error("failed to prepare worker registration lookup");
+    }
+
+    bind_text(lookup_stmt, 1, worker_id);
+    if (sqlite3_step(lookup_stmt) == SQLITE_ROW) {
+        worker.registered_at_ms = sqlite3_column_int64(lookup_stmt, 0);
+    } else {
+        sqlite3_finalize(lookup_stmt);
+        throw std::runtime_error("registered worker could not be loaded");
+    }
+    sqlite3_finalize(lookup_stmt);
+    return worker;
+}
+
+std::optional<Worker> TaskStore::record_worker_heartbeat(const std::string& worker_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    const auto timestamp = now_ms();
+    sqlite3_stmt* stmt = nullptr;
+    const char* sql = R"SQL(
+        UPDATE workers
+        SET status = ?, last_heartbeat_at_ms = ?
+        WHERE id = ?;
+    )SQL";
+
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        throw std::runtime_error("failed to prepare worker heartbeat");
+    }
+
+    bind_text(stmt, 1, to_string(WorkerStatus::Online));
+    sqlite3_bind_int64(stmt, 2, timestamp);
+    bind_text(stmt, 3, worker_id);
+
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        sqlite3_finalize(stmt);
+        throw std::runtime_error("failed to record worker heartbeat");
+    }
+    sqlite3_finalize(stmt);
+
+    if (sqlite3_changes(db_) == 0) {
+        return std::nullopt;
+    }
+
+    sqlite3_stmt* lookup_stmt = nullptr;
+    const char* lookup_sql = R"SQL(
+        SELECT id, status, registered_at_ms, last_heartbeat_at_ms
+        FROM workers
+        WHERE id = ?;
+    )SQL";
+
+    if (sqlite3_prepare_v2(db_, lookup_sql, -1, &lookup_stmt, nullptr) != SQLITE_OK) {
+        throw std::runtime_error("failed to prepare worker heartbeat lookup");
+    }
+
+    bind_text(lookup_stmt, 1, worker_id);
+    std::optional<Worker> worker;
+    if (sqlite3_step(lookup_stmt) == SQLITE_ROW) {
+        worker = read_worker(lookup_stmt);
+    }
+    sqlite3_finalize(lookup_stmt);
+    return worker;
+}
+
+std::vector<Worker> TaskStore::list_workers() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    sqlite3_stmt* stmt = nullptr;
+    const char* sql = R"SQL(
+        SELECT id, status, registered_at_ms, last_heartbeat_at_ms
+        FROM workers
+        ORDER BY registered_at_ms ASC;
+    )SQL";
+
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        throw std::runtime_error("failed to prepare worker list");
+    }
+
+    std::vector<Worker> workers;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        workers.push_back(read_worker(stmt));
+    }
+    sqlite3_finalize(stmt);
+    return workers;
 }
 
 void TaskStore::exec(const char* sql) const {
