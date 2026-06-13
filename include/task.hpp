@@ -40,7 +40,9 @@ struct Task {
     int max_attempts = 3;
     std::optional<std::string> assigned_worker_id;
     std::optional<std::int64_t> lease_expires_at_ms;
+    std::int64_t lease_id = 0;
     std::int64_t created_at_ms = 0;
     std::int64_t updated_at_ms = 0;
     std::optional<std::int64_t> completed_at_ms;
+    std::optional<std::string> last_error;
 };

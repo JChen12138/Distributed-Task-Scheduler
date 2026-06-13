@@ -1,6 +1,7 @@
 #include <cstdlib>
 #include <crow.h>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 
 #include "task_store.hpp"
@@ -23,6 +24,7 @@ crow::json::wvalue task_to_json(const Task& task) {
     body["status"] = to_string(task.status);
     body["attempt_count"] = task.attempt_count;
     body["max_attempts"] = task.max_attempts;
+    body["lease_id"] = task.lease_id;
     body["created_at_ms"] = task.created_at_ms;
     body["updated_at_ms"] = task.updated_at_ms;
 
@@ -35,6 +37,9 @@ crow::json::wvalue task_to_json(const Task& task) {
     if (task.completed_at_ms.has_value()) {
         body["completed_at_ms"] = *task.completed_at_ms;
     }
+    if (task.last_error.has_value()) {
+        body["last_error"] = *task.last_error;
+    }
 
     return body;
 }
@@ -46,6 +51,78 @@ crow::json::wvalue worker_to_json(const Worker& worker) {
     body["registered_at_ms"] = worker.registered_at_ms;
     body["last_heartbeat_at_ms"] = worker.last_heartbeat_at_ms;
     return body;
+}
+
+int parse_positive_int_field(const crow::json::rvalue& request_body,
+                             const char* field_name,
+                             int default_value) {
+    if (!request_body.has(field_name)) {
+        return default_value;
+    }
+    if (request_body[field_name].t() != crow::json::type::Number) {
+        throw std::invalid_argument(std::string("Field '") + field_name + "' must be a number");
+    }
+
+    const int value = static_cast<int>(request_body[field_name].i());
+    if (value <= 0) {
+        throw std::invalid_argument(std::string("Field '") + field_name + "' must be greater than zero");
+    }
+    return value;
+}
+
+std::string parse_required_string_field(const crow::json::rvalue& request_body,
+                                        const char* field_name) {
+    if (!request_body.has(field_name) ||
+        request_body[field_name].t() != crow::json::type::String) {
+        throw std::invalid_argument(std::string("Field '") + field_name + "' is required and must be a string");
+    }
+
+    const std::string value = std::string(request_body[field_name].s());
+    if (value.empty()) {
+        throw std::invalid_argument(std::string("Field '") + field_name + "' must not be empty");
+    }
+    return value;
+}
+
+std::int64_t parse_required_positive_i64_field(const crow::json::rvalue& request_body,
+                                               const char* field_name) {
+    if (!request_body.has(field_name) ||
+        request_body[field_name].t() != crow::json::type::Number) {
+        throw std::invalid_argument(std::string("Field '") + field_name + "' is required and must be a number");
+    }
+
+    const auto value = request_body[field_name].i();
+    if (value <= 0) {
+        throw std::invalid_argument(std::string("Field '") + field_name + "' must be greater than zero");
+    }
+    return value;
+}
+
+crow::response task_report_response(const TaskReportResult& result) {
+    if (result.status == TaskReportStatus::TaskNotFound) {
+        return json_error(404, "Task not found");
+    }
+    if (result.status == TaskReportStatus::WorkerNotFound) {
+        return json_error(404, "Worker not registered");
+    }
+    if (result.status == TaskReportStatus::StaleLease) {
+        crow::json::wvalue body;
+        body["error"] = "Task lease is no longer current";
+        if (result.task.has_value()) {
+            body["task"] = task_to_json(*result.task);
+        }
+        return json_response(409, std::move(body));
+    }
+
+    crow::json::wvalue body;
+    body["accepted"] = true;
+    body["status"] = result.status == TaskReportStatus::Completed
+        ? "COMPLETED"
+        : result.status == TaskReportStatus::FailedRetryable
+            ? "FAILED_RETRYABLE"
+            : "FAILED_FINAL";
+    body["task"] = task_to_json(*result.task);
+    return json_response(200, std::move(body));
 }
 
 int parse_port(int argc, char** argv) {
@@ -193,6 +270,103 @@ int main(int argc, char** argv) {
                 return json_error(500, ex.what());
             }
         });
+
+        CROW_ROUTE(app, "/workers/<string>/poll").methods("POST"_method)(
+            [&store](const crow::request& req, const std::string& worker_id) {
+                if (worker_id.empty()) {
+                    return json_error(400, "Worker id must not be empty");
+                }
+
+                int lease_ms = 30000;
+                if (!req.body.empty()) {
+                    const auto request_body = crow::json::load(req.body);
+                    if (!request_body) {
+                        return json_error(400, "Request body must be valid JSON");
+                    }
+
+                    try {
+                        lease_ms = parse_positive_int_field(request_body, "lease_ms", lease_ms);
+                    } catch (const std::invalid_argument& ex) {
+                        return json_error(400, ex.what());
+                    }
+                }
+
+                try {
+                    const auto poll_result = store.poll_task_for_worker(worker_id, lease_ms);
+                    if (poll_result.status == WorkerPollStatus::WorkerNotFound) {
+                        return json_error(404, "Worker not registered");
+                    }
+
+                    crow::json::wvalue body;
+                    body["worker_id"] = worker_id;
+                    body["lease_ms"] = lease_ms;
+
+                    if (poll_result.status == WorkerPollStatus::NoTaskAvailable) {
+                        body["leased"] = false;
+                        body["task"] = nullptr;
+                        return json_response(200, std::move(body));
+                    }
+
+                    body["leased"] = true;
+                    body["task"] = task_to_json(*poll_result.task);
+                    return json_response(200, std::move(body));
+                } catch (const std::exception& ex) {
+                    return json_error(500, ex.what());
+                }
+            });
+
+        CROW_ROUTE(app, "/tasks/<string>/complete").methods("POST"_method)(
+            [&store](const crow::request& req, const std::string& task_id) {
+                const auto request_body = crow::json::load(req.body);
+                if (!request_body) {
+                    return json_error(400, "Request body must be valid JSON");
+                }
+
+                std::string worker_id;
+                std::int64_t lease_id = 0;
+                try {
+                    worker_id = parse_required_string_field(request_body, "worker_id");
+                    lease_id = parse_required_positive_i64_field(request_body, "lease_id");
+                } catch (const std::invalid_argument& ex) {
+                    return json_error(400, ex.what());
+                }
+
+                try {
+                    return task_report_response(store.complete_task(task_id, worker_id, lease_id));
+                } catch (const std::exception& ex) {
+                    return json_error(500, ex.what());
+                }
+            });
+
+        CROW_ROUTE(app, "/tasks/<string>/fail").methods("POST"_method)(
+            [&store](const crow::request& req, const std::string& task_id) {
+                const auto request_body = crow::json::load(req.body);
+                if (!request_body) {
+                    return json_error(400, "Request body must be valid JSON");
+                }
+
+                std::string worker_id;
+                std::int64_t lease_id = 0;
+                std::string error_message;
+                try {
+                    worker_id = parse_required_string_field(request_body, "worker_id");
+                    lease_id = parse_required_positive_i64_field(request_body, "lease_id");
+                    if (request_body.has("error")) {
+                        if (request_body["error"].t() != crow::json::type::String) {
+                            return json_error(400, "Field 'error' must be a string");
+                        }
+                        error_message = std::string(request_body["error"].s());
+                    }
+                } catch (const std::invalid_argument& ex) {
+                    return json_error(400, ex.what());
+                }
+
+                try {
+                    return task_report_response(store.fail_task(task_id, worker_id, lease_id, error_message));
+                } catch (const std::exception& ex) {
+                    return json_error(500, ex.what());
+                }
+            });
 
         const int port = parse_port(argc, argv);
         std::cout << "scheduler listening on http://127.0.0.1:" << port << "\n";
