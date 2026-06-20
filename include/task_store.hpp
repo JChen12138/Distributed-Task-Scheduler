@@ -26,6 +26,13 @@ enum class TaskReportStatus {
     FailedFinal
 };
 
+enum class LeaseRenewStatus {
+    TaskNotFound,
+    WorkerNotFound,
+    StaleLease,
+    Renewed
+};
+
 struct WorkerPollResult {
     WorkerPollStatus status = WorkerPollStatus::NoTaskAvailable;
     std::optional<Task> task;
@@ -34,6 +41,17 @@ struct WorkerPollResult {
 struct TaskReportResult {
     TaskReportStatus status = TaskReportStatus::TaskNotFound;
     std::optional<Task> task;
+};
+
+struct LeaseRenewResult {
+    LeaseRenewStatus status = LeaseRenewStatus::TaskNotFound;
+    std::optional<Task> task;
+};
+
+struct LeaseMaintenanceResult {
+    int workers_marked_offline = 0;
+    int leases_requeued = 0;
+    int leases_failed_final = 0;
 };
 
 class TaskStore {
@@ -59,6 +77,11 @@ public:
                                const std::string& worker_id,
                                std::int64_t lease_id,
                                const std::string& error_message);
+    LeaseRenewResult renew_task_lease(const std::string& task_id,
+                                      const std::string& worker_id,
+                                      std::int64_t lease_id,
+                                      std::int64_t lease_ms);
+    LeaseMaintenanceResult run_lease_maintenance(std::int64_t worker_timeout_ms);
 
 private:
     sqlite3* db_ = nullptr;

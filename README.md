@@ -1,6 +1,6 @@
 # Distributed Task Scheduler (C++17)
 
-A hands-on C++17 backend/systems project focused on a lease-based task scheduler with a Crow HTTP API, SQLite-backed task and worker state, atomic task leasing, lease-token validation, retry handling, and explicit task lifecycle tracking.
+A hands-on C++17 backend/systems project focused on a lease-based task scheduler with a Crow HTTP API, SQLite-backed task and worker state, atomic task leasing, lease renewal, lease-expiration recovery, lease-token validation, retry handling, and explicit task lifecycle tracking.
 
 ## Project Goal
 
@@ -19,15 +19,23 @@ Build a portfolio-quality distributed systems project that demonstrates:
 - SQLite-backed `TaskStore` with WAL mode enabled
 - Durable `tasks` table for payload, status, retry metadata, lease metadata, timestamps, and `last_error`
 - Durable `workers` table for worker identity, status, registration time, and heartbeat time
-- Task creation, listing, lookup, polling, completion, and failure-reporting endpoints
+- Task creation, listing, lookup, lease renewal, completion, and failure-reporting endpoints
 - Worker registration, heartbeat, polling, and listing endpoints
 - Atomic task leasing from `PENDING` to `LEASED` using a SQLite transaction
+- Lease renewal for long-running tasks
+- Background lease-expiration scanning and task reassignment
+- Worker timeout detection that marks stale workers `OFFLINE`
 - Lease-token validation through a per-task `lease_id`
 - Retryable failure behavior until `max_attempts` is exhausted
 - Shared `scheduler_core` library with separate `scheduler` and placeholder `worker` executables
 
 ## Recent Additions
 
+- Added lease renewal through `POST /tasks/{task_id}/renew`
+- Added a background lease-maintenance loop controlled by `SCHEDULER_LEASE_SCAN_INTERVAL_MS`
+- Added worker timeout handling controlled by `WORKER_TIMEOUT_MS`
+- Added automatic reassignment behavior: expired retryable leases return to `PENDING`
+- Added automatic terminal failure for expired leases whose retry budget is exhausted
 - Added worker polling through `POST /workers/{worker_id}/poll`
 - Added task completion and failure reporting through `POST /tasks/{task_id}/complete` and `POST /tasks/{task_id}/fail`
 - Added `lease_id` as a lease-generation token so stale worker reports can be rejected
@@ -38,10 +46,12 @@ Build a portfolio-quality distributed systems project that demonstrates:
 ## Important Behavior Notes
 
 - Worker polling leases the oldest eligible `PENDING` task, assigns it to the polling worker, sets `lease_expires_at_ms`, increments `attempt_count`, and increments `lease_id`.
+- Lease renewal extends `lease_expires_at_ms` only when the reported `worker_id` and `lease_id` still match the current task lease.
+- The background scanner periodically marks stale workers `OFFLINE`, returns retryable expired leases to `PENDING`, and moves exhausted expired leases to `FAILED_FINAL`.
+- Requeued work receives a new `lease_id` the next time a worker polls it, so old worker reports are rejected.
 - Completion and failure reports must include the current `worker_id` and `lease_id`; stale workers, stale lease generations, and expired leases are rejected with `409 Conflict`.
 - Failure reporting stores `last_error` and returns the task to `PENDING` while attempts remain. Once `attempt_count` reaches `max_attempts`, the task moves to `FAILED_FINAL`.
 - Polling refreshes the worker heartbeat and keeps the worker marked `ONLINE`.
-- Expired lease reports are rejected today, but there is not yet a background scanner that automatically returns expired `LEASED` tasks to `PENDING`.
 - Task execution is intended to use at-least-once semantics, so workers should treat external side effects as idempotent.
 - The current worker executable is still a placeholder; the implemented work is on the scheduler-side API and persistence boundary.
 
@@ -86,6 +96,18 @@ Run the scheduler API:
 
 The scheduler also accepts the port from `SCHEDULER_PORT` when a port argument is not provided.
 
+Optional scheduler timing knobs:
+
+```powershell
+$env:SCHEDULER_LEASE_SCAN_INTERVAL_MS = "1000"
+$env:WORKER_TIMEOUT_MS = "30000"
+```
+
+Defaults:
+
+- `SCHEDULER_LEASE_SCAN_INTERVAL_MS=1000`
+- `WORKER_TIMEOUT_MS=30000`
+
 ```text
 http://127.0.0.1:8080
 ```
@@ -110,6 +132,7 @@ The repository currently defines three build targets:
 | `POST /workers/{worker_id}/heartbeat` | Record worker heartbeat |
 | `GET /workers` | List workers |
 | `POST /workers/{worker_id}/poll` | Lease one pending task if available |
+| `POST /tasks/{task_id}/renew` | Renew the current task lease |
 | `POST /tasks/{task_id}/complete` | Complete a leased task |
 | `POST /tasks/{task_id}/fail` | Report task failure |
 
@@ -130,6 +153,14 @@ curl.exe -X POST http://127.0.0.1:8080/tasks/<task-id>/fail -H "Content-Type: ap
 
 Polling request body is optional; when `lease_ms` is omitted, the scheduler uses a 30 second lease. Polling an empty queue returns a successful no-task response instead of an error.
 
+Renew a lease while a worker is still running:
+
+```powershell
+curl.exe -X POST http://127.0.0.1:8080/tasks/<task-id>/renew -H "Content-Type: application/json" -d "{\"worker_id\":\"worker-1\",\"lease_id\":1,\"lease_ms\":30000}"
+```
+
+Renewal keeps the same `lease_id`; it only extends `lease_expires_at_ms`. If the lease already expired, was reassigned, or belongs to another worker, renewal returns `409 Conflict`.
+
 ## Task State Model
 
 ```text
@@ -146,7 +177,11 @@ LEASED
 
 LEASED
   -> lease expired
-  -> PENDING    planned automatic recovery
+  -> PENDING
+
+LEASED
+  -> lease expired, retry attempts exhausted
+  -> FAILED_FINAL
 
 PENDING or LEASED
   -> CANCELLED  planned
@@ -161,16 +196,18 @@ Client / Worker
   -> SQLite tasks/workers tables
 ```
 
-`TaskStore` owns the main coordination rules: schema initialization, task creation, worker registration, heartbeat updates, atomic lease assignment, and lease validation before completion or failure reports are accepted. Access is serialized with an internal mutex, which keeps the current single-scheduler-process design straightforward.
+`TaskStore` owns the main coordination rules: schema initialization, task creation, worker registration, heartbeat updates, atomic lease assignment, lease renewal, lease-expiration recovery, and lease validation before completion or failure reports are accepted. Access is serialized with an internal mutex, which keeps the current single-scheduler-process design straightforward.
 
 ## Execution Flow
 
 1. A client creates a task with `POST /tasks`; the scheduler stores it as `PENDING`.
 2. A worker registers, then polls through `POST /workers/{worker_id}/poll`.
 3. The scheduler leases the oldest eligible pending task, updates lease metadata, and returns the task to the worker.
-4. The worker reports success or failure with its `worker_id` and `lease_id`.
-5. The scheduler accepts only current leases; stale or expired reports are rejected.
-6. Failed tasks retry until `max_attempts` is exhausted, then move to `FAILED_FINAL`.
+4. The worker renews the lease if execution needs more time.
+5. The worker reports success or failure with its `worker_id` and `lease_id`.
+6. The scheduler accepts only current leases; stale or expired reports are rejected.
+7. Failed tasks retry until `max_attempts` is exhausted, then move to `FAILED_FINAL`.
+8. If a worker disappears, the background scanner marks it `OFFLINE` and requeues or terminal-fails its leased tasks based on retry budget.
 
 ## Tests
 
@@ -185,17 +222,19 @@ Manual coverage currently exercises:
 - task completion with current lease ownership
 - retryable failure and terminal failure behavior
 - stale worker result rejection
+- lease renewal with current lease ownership
+- expired lease reassignment to another worker
+- expired lease terminal failure after retry exhaustion
+- stale worker timeout to `OFFLINE`
 
 ## Engineering Positioning
 
 This project is a backend/systems portfolio project rather than a CRUD demo. The focus is on durable state, leases, retries, worker health, and recovery rules in a small scheduler architecture.
 
-The current milestone is the scheduler API and persistence foundation for a lease-based task execution platform. The next milestone is lease expiry and reassignment: background scanning, stale-worker recovery, metrics, and a real worker agent.
+The current milestone is the scheduler API and persistence foundation for a lease-based task execution platform. The next milestone is turning the placeholder worker target into a real worker agent and adding metrics/demo scripts.
 
 ## Roadmap
 
-- Add background lease-expiration scanning and task reassignment
-- Add lease renewal while tasks are running
 - Replace the placeholder worker executable with a polling worker agent
 - Add task cancellation endpoint
 - Add Prometheus-compatible metrics for task lifecycle and worker health

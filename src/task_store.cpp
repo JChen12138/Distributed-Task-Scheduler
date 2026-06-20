@@ -736,6 +736,240 @@ TaskReportResult TaskStore::fail_task(const std::string& task_id,
     }
 }
 
+LeaseRenewResult TaskStore::renew_task_lease(const std::string& task_id,
+                                             const std::string& worker_id,
+                                             std::int64_t lease_id,
+                                             std::int64_t lease_ms) {
+    if (lease_id <= 0) {
+        throw std::invalid_argument("lease_id must be greater than zero");
+    }
+    if (lease_ms <= 0) {
+        throw std::invalid_argument("lease_ms must be greater than zero");
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    const auto timestamp = now_ms();
+    const auto new_lease_expires_at_ms = timestamp + lease_ms;
+    bool transaction_open = false;
+
+    try {
+        exec("BEGIN IMMEDIATE;");
+        transaction_open = true;
+
+        if (!worker_exists(db_, worker_id)) {
+            rollback_if_open(db_, transaction_open);
+            return {LeaseRenewStatus::WorkerNotFound, std::nullopt};
+        }
+
+        const auto task = load_task_by_id(db_, task_id);
+        if (!task.has_value()) {
+            rollback_if_open(db_, transaction_open);
+            return {LeaseRenewStatus::TaskNotFound, std::nullopt};
+        }
+
+        if (!is_current_lease(*task, worker_id, lease_id, timestamp)) {
+            rollback_if_open(db_, transaction_open);
+            return {LeaseRenewStatus::StaleLease, *task};
+        }
+
+        sqlite3_stmt* worker_stmt = nullptr;
+        const char* worker_sql = R"SQL(
+            UPDATE workers
+            SET status = ?, last_heartbeat_at_ms = ?
+            WHERE id = ?;
+        )SQL";
+
+        if (sqlite3_prepare_v2(db_, worker_sql, -1, &worker_stmt, nullptr) != SQLITE_OK) {
+            throw std::runtime_error("failed to prepare worker heartbeat during lease renewal");
+        }
+
+        bind_text(worker_stmt, 1, to_string(WorkerStatus::Online));
+        sqlite3_bind_int64(worker_stmt, 2, timestamp);
+        bind_text(worker_stmt, 3, worker_id);
+
+        if (sqlite3_step(worker_stmt) != SQLITE_DONE) {
+            sqlite3_finalize(worker_stmt);
+            throw std::runtime_error("failed to update worker heartbeat during lease renewal");
+        }
+        sqlite3_finalize(worker_stmt);
+
+        sqlite3_stmt* lease_stmt = nullptr;
+        const char* lease_sql = R"SQL(
+            UPDATE tasks
+            SET lease_expires_at_ms = ?,
+                updated_at_ms = ?
+            WHERE id = ?
+              AND status = ?
+              AND assigned_worker_id = ?
+              AND lease_id = ?
+              AND lease_expires_at_ms >= ?;
+        )SQL";
+
+        if (sqlite3_prepare_v2(db_, lease_sql, -1, &lease_stmt, nullptr) != SQLITE_OK) {
+            throw std::runtime_error("failed to prepare lease renewal");
+        }
+
+        sqlite3_bind_int64(lease_stmt, 1, new_lease_expires_at_ms);
+        sqlite3_bind_int64(lease_stmt, 2, timestamp);
+        bind_text(lease_stmt, 3, task_id);
+        bind_text(lease_stmt, 4, to_string(TaskStatus::Leased));
+        bind_text(lease_stmt, 5, worker_id);
+        sqlite3_bind_int64(lease_stmt, 6, lease_id);
+        sqlite3_bind_int64(lease_stmt, 7, timestamp);
+
+        if (sqlite3_step(lease_stmt) != SQLITE_DONE) {
+            sqlite3_finalize(lease_stmt);
+            throw std::runtime_error("failed to renew task lease");
+        }
+        sqlite3_finalize(lease_stmt);
+
+        if (sqlite3_changes(db_) != 1) {
+            rollback_if_open(db_, transaction_open);
+            return {LeaseRenewStatus::StaleLease, task};
+        }
+
+        const auto updated_task = load_task_by_id(db_, task_id);
+        if (!updated_task.has_value()) {
+            throw std::runtime_error("renewed task could not be loaded");
+        }
+
+        exec("COMMIT;");
+        transaction_open = false;
+        return {LeaseRenewStatus::Renewed, updated_task};
+    } catch (...) {
+        rollback_if_open(db_, transaction_open);
+        throw;
+    }
+}
+
+LeaseMaintenanceResult TaskStore::run_lease_maintenance(std::int64_t worker_timeout_ms) {
+    if (worker_timeout_ms <= 0) {
+        throw std::invalid_argument("worker_timeout_ms must be greater than zero");
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    const auto timestamp = now_ms();
+    const auto worker_timeout_before_ms = timestamp - worker_timeout_ms;
+    LeaseMaintenanceResult result;
+    bool transaction_open = false;
+
+    try {
+        exec("BEGIN IMMEDIATE;");
+        transaction_open = true;
+
+        sqlite3_stmt* offline_stmt = nullptr;
+        const char* offline_sql = R"SQL(
+            UPDATE workers
+            SET status = ?
+            WHERE status = ? AND last_heartbeat_at_ms < ?;
+        )SQL";
+
+        if (sqlite3_prepare_v2(db_, offline_sql, -1, &offline_stmt, nullptr) != SQLITE_OK) {
+            throw std::runtime_error("failed to prepare stale-worker update");
+        }
+
+        bind_text(offline_stmt, 1, to_string(WorkerStatus::Offline));
+        bind_text(offline_stmt, 2, to_string(WorkerStatus::Online));
+        sqlite3_bind_int64(offline_stmt, 3, worker_timeout_before_ms);
+
+        if (sqlite3_step(offline_stmt) != SQLITE_DONE) {
+            sqlite3_finalize(offline_stmt);
+            throw std::runtime_error("failed to mark stale workers offline");
+        }
+        sqlite3_finalize(offline_stmt);
+        result.workers_marked_offline = sqlite3_changes(db_);
+
+        sqlite3_stmt* requeue_stmt = nullptr;
+        const char* requeue_sql = R"SQL(
+            UPDATE tasks
+            SET status = ?,
+                assigned_worker_id = NULL,
+                lease_expires_at_ms = NULL,
+                updated_at_ms = ?,
+                last_error = ?
+            WHERE status = ?
+              AND attempt_count < max_attempts
+              AND (
+                    lease_expires_at_ms < ?
+                    OR assigned_worker_id IN (
+                        SELECT id
+                        FROM workers
+                        WHERE status = ? AND last_heartbeat_at_ms < ?
+                    )
+              );
+        )SQL";
+
+        if (sqlite3_prepare_v2(db_, requeue_sql, -1, &requeue_stmt, nullptr) != SQLITE_OK) {
+            throw std::runtime_error("failed to prepare expired-lease requeue");
+        }
+
+        bind_text(requeue_stmt, 1, to_string(TaskStatus::Pending));
+        sqlite3_bind_int64(requeue_stmt, 2, timestamp);
+        bind_text(requeue_stmt, 3, "lease expired or worker heartbeat timed out");
+        bind_text(requeue_stmt, 4, to_string(TaskStatus::Leased));
+        sqlite3_bind_int64(requeue_stmt, 5, timestamp);
+        bind_text(requeue_stmt, 6, to_string(WorkerStatus::Offline));
+        sqlite3_bind_int64(requeue_stmt, 7, worker_timeout_before_ms);
+
+        if (sqlite3_step(requeue_stmt) != SQLITE_DONE) {
+            sqlite3_finalize(requeue_stmt);
+            throw std::runtime_error("failed to requeue expired leases");
+        }
+        sqlite3_finalize(requeue_stmt);
+        result.leases_requeued = sqlite3_changes(db_);
+
+        sqlite3_stmt* fail_stmt = nullptr;
+        const char* fail_sql = R"SQL(
+            UPDATE tasks
+            SET status = ?,
+                assigned_worker_id = NULL,
+                lease_expires_at_ms = NULL,
+                updated_at_ms = ?,
+                completed_at_ms = ?,
+                last_error = ?
+            WHERE status = ?
+              AND attempt_count >= max_attempts
+              AND (
+                    lease_expires_at_ms < ?
+                    OR assigned_worker_id IN (
+                        SELECT id
+                        FROM workers
+                        WHERE status = ? AND last_heartbeat_at_ms < ?
+                    )
+              );
+        )SQL";
+
+        if (sqlite3_prepare_v2(db_, fail_sql, -1, &fail_stmt, nullptr) != SQLITE_OK) {
+            throw std::runtime_error("failed to prepare expired-lease terminal failure");
+        }
+
+        bind_text(fail_stmt, 1, to_string(TaskStatus::FailedFinal));
+        sqlite3_bind_int64(fail_stmt, 2, timestamp);
+        sqlite3_bind_int64(fail_stmt, 3, timestamp);
+        bind_text(fail_stmt, 4, "lease expired or worker heartbeat timed out; retry attempts exhausted");
+        bind_text(fail_stmt, 5, to_string(TaskStatus::Leased));
+        sqlite3_bind_int64(fail_stmt, 6, timestamp);
+        bind_text(fail_stmt, 7, to_string(WorkerStatus::Offline));
+        sqlite3_bind_int64(fail_stmt, 8, worker_timeout_before_ms);
+
+        if (sqlite3_step(fail_stmt) != SQLITE_DONE) {
+            sqlite3_finalize(fail_stmt);
+            throw std::runtime_error("failed to mark expired leases failed");
+        }
+        sqlite3_finalize(fail_stmt);
+        result.leases_failed_final = sqlite3_changes(db_);
+
+        exec("COMMIT;");
+        transaction_open = false;
+        return result;
+    } catch (...) {
+        rollback_if_open(db_, transaction_open);
+        throw;
+    }
+}
+
 void TaskStore::exec(const char* sql) const {
     char* error = nullptr;
     if (sqlite3_exec(db_, sql, nullptr, nullptr, &error) != SQLITE_OK) {

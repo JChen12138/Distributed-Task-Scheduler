@@ -1,8 +1,11 @@
 #include <cstdlib>
 #include <crow.h>
+#include <atomic>
+#include <chrono>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 #include "task_store.hpp"
 
@@ -125,6 +128,29 @@ crow::response task_report_response(const TaskReportResult& result) {
     return json_response(200, std::move(body));
 }
 
+crow::response lease_renew_response(const LeaseRenewResult& result) {
+    if (result.status == LeaseRenewStatus::TaskNotFound) {
+        return json_error(404, "Task not found");
+    }
+    if (result.status == LeaseRenewStatus::WorkerNotFound) {
+        return json_error(404, "Worker not registered");
+    }
+    if (result.status == LeaseRenewStatus::StaleLease) {
+        crow::json::wvalue body;
+        body["error"] = "Task lease is no longer current";
+        if (result.task.has_value()) {
+            body["task"] = task_to_json(*result.task);
+        }
+        return json_response(409, std::move(body));
+    }
+
+    crow::json::wvalue body;
+    body["accepted"] = true;
+    body["status"] = "RENEWED";
+    body["task"] = task_to_json(*result.task);
+    return json_response(200, std::move(body));
+}
+
 int parse_port(int argc, char** argv) {
     if (argc > 2) {
         return std::stoi(argv[2]);
@@ -136,6 +162,19 @@ int parse_port(int argc, char** argv) {
     }
 
     return 8080;
+}
+
+int parse_positive_env(const char* name, int default_value) {
+    const char* raw_value = std::getenv(name);
+    if (raw_value == nullptr) {
+        return default_value;
+    }
+
+    const int value = std::stoi(raw_value);
+    if (value <= 0) {
+        throw std::invalid_argument(std::string(name) + " must be greater than zero");
+    }
+    return value;
 }
 }
 
@@ -368,11 +407,81 @@ int main(int argc, char** argv) {
                 }
             });
 
+        CROW_ROUTE(app, "/tasks/<string>/renew").methods("POST"_method)(
+            [&store](const crow::request& req, const std::string& task_id) {
+                const auto request_body = crow::json::load(req.body);
+                if (!request_body) {
+                    return json_error(400, "Request body must be valid JSON");
+                }
+
+                std::string worker_id;
+                std::int64_t lease_id = 0;
+                int lease_ms = 30000;
+                try {
+                    worker_id = parse_required_string_field(request_body, "worker_id");
+                    lease_id = parse_required_positive_i64_field(request_body, "lease_id");
+                    lease_ms = parse_positive_int_field(request_body, "lease_ms", lease_ms);
+                } catch (const std::invalid_argument& ex) {
+                    return json_error(400, ex.what());
+                }
+
+                try {
+                    return lease_renew_response(store.renew_task_lease(task_id, worker_id, lease_id, lease_ms));
+                } catch (const std::exception& ex) {
+                    return json_error(500, ex.what());
+                }
+            });
+
         const int port = parse_port(argc, argv);
+        const int lease_scan_interval_ms = parse_positive_env("SCHEDULER_LEASE_SCAN_INTERVAL_MS", 1000);
+        const int worker_timeout_ms = parse_positive_env("WORKER_TIMEOUT_MS", 30000);
+        std::atomic<bool> stop_maintenance{false};
+
+        std::thread maintenance_thread([&store,
+                                        &stop_maintenance,
+                                        lease_scan_interval_ms,
+                                        worker_timeout_ms]() {
+            while (!stop_maintenance.load(std::memory_order_relaxed)) {
+                try {
+                    const auto result = store.run_lease_maintenance(worker_timeout_ms);
+                    if (result.workers_marked_offline > 0 ||
+                        result.leases_requeued > 0 ||
+                        result.leases_failed_final > 0) {
+                        std::cout << "lease maintenance: workers_offline="
+                                  << result.workers_marked_offline
+                                  << " leases_requeued="
+                                  << result.leases_requeued
+                                  << " leases_failed_final="
+                                  << result.leases_failed_final
+                                  << "\n";
+                    }
+                } catch (const std::exception& ex) {
+                    std::cerr << "lease maintenance failed: " << ex.what() << "\n";
+                }
+
+                std::this_thread::sleep_for(std::chrono::milliseconds(lease_scan_interval_ms));
+            }
+        });
+
         std::cout << "scheduler listening on http://127.0.0.1:" << port << "\n";
         std::cout << "using task database: " << db_path << "\n";
+        std::cout << "lease scanner interval ms: " << lease_scan_interval_ms << "\n";
+        std::cout << "worker timeout ms: " << worker_timeout_ms << "\n";
 
-        app.bindaddr("127.0.0.1").port(port).multithreaded().run();
+        try {
+            app.bindaddr("127.0.0.1").port(port).multithreaded().run();
+        } catch (...) {
+            stop_maintenance.store(true, std::memory_order_relaxed);
+            if (maintenance_thread.joinable()) {
+                maintenance_thread.join();
+            }
+            throw;
+        }
+
+        stop_maintenance.store(true, std::memory_order_relaxed);
+        if (maintenance_thread.joinable()) {
+            maintenance_thread.join();
+        }
     } catch (const std::exception& ex) {
         std::cerr << "scheduler failed: " << ex.what() << "\n";
         return 1;
